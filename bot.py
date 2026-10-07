@@ -43,35 +43,46 @@ TOKEN = os.environ["BOT_TOKEN"]
 
 MAX_MB = int(os.getenv("MAX_FILE_MB", "20"))
 
+# More workers = faster, but too many can trigger rate limits.
 WORKERS = max(
     1,
     min(
-        int(os.getenv("TRANSLATE_WORKERS", "3")),
-        8,
+        int(os.getenv("TRANSLATE_WORKERS", "6")),
+        10,
     ),
 )
 
 CHUNK = max(
     1000,
     min(
-        int(os.getenv("CHUNK_SIZE", "3500")),
-        4500,
+        int(os.getenv("CHUNK_SIZE", "4200")),
+        4600,
+    ),
+)
+
+BATCH_CHARS = max(
+    1800,
+    min(
+        int(os.getenv("BATCH_CHARS", "4200")),
+        4600,
     ),
 )
 
 RETRIES = max(
     1,
     min(
-        int(os.getenv("TRANSLATE_RETRIES", "5")),
-        8,
+        int(os.getenv("TRANSLATE_RETRIES", "4")),
+        7,
     ),
 )
 
-BATCH_CHARS = max(
-    CHUNK,
-    min(
-        int(os.getenv("BATCH_CHARS", "3500")),
-        4500,
+UPDATE_SECONDS = max(
+    2,
+    float(
+        os.getenv(
+            "PROGRESS_UPDATE_SECONDS",
+            "3",
+        )
     ),
 )
 
@@ -100,7 +111,10 @@ LANGS = {
 }
 
 
-# Tags whose contents should NOT be translated.
+# ============================================================
+# HTML
+# ============================================================
+
 SKIP_TAGS = {
     "script",
     "style",
@@ -110,27 +124,44 @@ SKIP_TAGS = {
     "svg",
 }
 
-
 _ws = re.compile(r"[ \t]+")
+WORD_RE = re.compile(r"\S+")
+
+MARKER_RE = re.compile(
+    r"\[\[EPUBSEG(\d{1,7})\]\]"
+)
 
 
 # ============================================================
-# TEXT HELPERS
+# WORD COUNT
 # ============================================================
 
-def chunk_text(text: str, size: int = CHUNK):
-    """
-    Split long text into smaller pieces while trying
-    to split at whitespace.
-    """
+def word_count(text: str) -> int:
+    return len(
+        WORD_RE.findall(text)
+    )
+
+
+# ============================================================
+# SPLIT LONG TEXT
+# ============================================================
+
+def split_long_text(
+    text: str,
+    size: int = CHUNK,
+):
 
     text = text.strip()
 
     while len(text) > size:
 
-        cut = text.rfind(" ", 0, size)
+        cut = text.rfind(
+            " ",
+            0,
+            size,
+        )
 
-        if cut < size * 0.55:
+        if cut < int(size * 0.55):
             cut = size
 
         yield text[:cut]
@@ -141,27 +172,36 @@ def chunk_text(text: str, size: int = CHUNK):
         yield text
 
 
-def restore_ws(original: str, translated: str) -> str:
-    """
-    Restore leading/trailing whitespace.
-    """
+# ============================================================
+# WHITESPACE
+# ============================================================
+
+def restore_ws(
+    original: str,
+    translated: str,
+) -> str:
 
     lead = original[
-        : len(original) - len(original.lstrip())
+        : len(original)
+        - len(original.lstrip())
     ]
 
     trail = original[
         len(original.rstrip()):
     ]
 
-    return lead + translated + trail
+    return (
+        lead
+        + translated
+        + trail
+    )
 
 
 # ============================================================
-# TRANSLATION
+# SINGLE TRANSLATION FALLBACK
 # ============================================================
 
-def translate_with_retry(
+def translate_one(
     translator,
     text: str,
 ) -> str:
@@ -171,7 +211,7 @@ def translate_with_retry(
 
     parts = []
 
-    for part in chunk_text(text):
+    for part in split_long_text(text):
 
         result = None
 
@@ -179,7 +219,9 @@ def translate_with_retry(
 
             try:
 
-                result = translator.translate(part)
+                result = translator.translate(
+                    part
+                )
 
                 if result:
                     break
@@ -187,9 +229,9 @@ def translate_with_retry(
             except Exception as exc:
 
                 delay = min(
-                    12,
-                    1.5 * (2 ** attempt),
-                ) + (attempt * 0.15)
+                    8.0,
+                    0.8 * (2 ** attempt),
+                )
 
                 log.warning(
                     "translation retry %d/%d: %s",
@@ -200,59 +242,104 @@ def translate_with_retry(
 
                 time.sleep(delay)
 
-        if not result:
-
-            # NEVER lose original text.
-            log.error(
-                "translation failed; preserving original chunk"
-            )
-
-            result = part
-
-        parts.append(result)
+        # Never lose original text.
+        parts.append(
+            result if result else part
+        )
 
     return " ".join(parts)
 
 
-def translate_batch(batch, target):
+# ============================================================
+# BATCH TRANSLATION
+# ============================================================
+
+def translate_marked_batch(
+    items,
+    target,
+):
+    """
+    Translate many text segments using one request.
+
+    Markers let us map translated text back
+    to the original EPUB text nodes.
+    """
 
     translator = GoogleTranslator(
         source="auto",
         target=target,
     )
 
-    if len(batch) == 1:
-        return [
-            translate_with_retry(
-                translator,
-                batch[0],
-            )
-        ]
-
-    joined = "\n".join(batch)
+    payload = "\n".join(
+        f"[[EPUBSEG{i}]] {text}"
+        for i, text in items
+    )
 
     for attempt in range(RETRIES):
 
         try:
 
-            result = translator.translate(joined)
+            result = translator.translate(
+                payload
+            )
 
             if result:
 
-                lines = result.splitlines()
+                matches = list(
+                    MARKER_RE.finditer(
+                        result
+                    )
+                )
 
-                if len(lines) == len(batch):
+                if (
+                    matches
+                    and len(matches)
+                    == len(items)
+                ):
 
-                    return [
-                        x.strip()
-                        for x in lines
-                    ]
+                    out = {}
+
+                    for pos, match in enumerate(
+                        matches
+                    ):
+
+                        start = match.end()
+
+                        if (
+                            pos + 1
+                            < len(matches)
+                        ):
+                            end = matches[
+                                pos + 1
+                            ].start()
+
+                        else:
+                            end = len(
+                                result
+                            )
+
+                        translated = (
+                            result[
+                                start:end
+                            ].strip()
+                        )
+
+                        out[
+                            items[pos][0]
+                        ] = translated
+
+                    if all(
+                        k in out
+                        and out[k]
+                        for k, _ in items
+                    ):
+                        return out
 
         except Exception as exc:
 
             delay = min(
-                10,
-                1.25 * (2 ** attempt),
+                8.0,
+                0.8 * (2 ** attempt),
             )
 
             log.warning(
@@ -264,140 +351,298 @@ def translate_batch(batch, target):
 
             time.sleep(delay)
 
-    # Safe fallback.
-    return [
-        translate_with_retry(
-            translator,
-            item,
-        )
-        for item in batch
-    ]
+    # --------------------------------------------------------
+    # Safe fallback
+    # --------------------------------------------------------
 
+    log.warning(
+        "Batch mapping failed; "
+        "falling back to individual translation."
+    )
+
+    return {
+        idx: translate_one(
+            translator,
+            text,
+        )
+        for idx, text in items
+    }
+
+
+# ============================================================
+# BUILD BATCHES
+# ============================================================
+
+def build_batches(texts):
+
+    batches = []
+
+    current = []
+
+    chars = 0
+
+    seg_id = 0
+
+    for original_index, raw in enumerate(
+        texts
+    ):
+
+        if not raw.strip():
+            continue
+
+        normalized = _ws.sub(
+            " ",
+            raw.strip(),
+        )
+
+        pieces = list(
+            split_long_text(
+                normalized,
+                CHUNK,
+            )
+        )
+
+        for piece in pieces:
+
+            # Marker overhead.
+            cost = len(piece) + 18
+
+            if (
+                current
+                and chars + cost + 1
+                > BATCH_CHARS
+            ):
+
+                batches.append(
+                    current
+                )
+
+                current = []
+
+                chars = 0
+
+            current.append(
+                (
+                    seg_id,
+                    piece,
+                    original_index,
+                )
+            )
+
+            seg_id += 1
+
+            chars += (
+                cost + 1
+            )
+
+    if current:
+        batches.append(
+            current
+        )
+
+    return batches
+
+
+# ============================================================
+# TRANSLATE MANY
+# ============================================================
 
 def translate_many(
     texts,
     target,
     progress=None,
-    workers=WORKERS,
 ):
 
-    clean = []
+    out = list(texts)
 
-    for text in texts:
+    batches = build_batches(
+        texts
+    )
 
-        if not text.strip():
-            clean.append("")
+    total_words = sum(
+        word_count(t)
+        for t in texts
+    )
 
-        else:
-            clean.append(
-                _ws.sub(
-                    " ",
-                    text.strip(),
-                )
+    if not batches:
+
+        if progress:
+
+            progress(
+                0,
+                0,
+                total_words,
+                total_words,
+                0,
             )
 
-    batches = []
-    indexes = []
+        return (
+            out,
+            total_words,
+        )
 
-    current = []
-    current_idx = []
-    chars = 0
+    completed_words = 0
 
-    for i, text in enumerate(clean):
+    completed_batches = 0
 
-        if not text:
-            continue
+    total_batches = len(
+        batches
+    )
 
-        extra = len(text)
+    started = time.monotonic()
 
-        if current:
-            extra += 1
+    lock = threading.Lock()
 
-        if (
-            current
-            and chars + extra > BATCH_CHARS
-        ):
+    def worker(batch):
 
-            batches.append(current)
-            indexes.append(current_idx)
+        request_items = [
+            (
+                seg_id,
+                text,
+            )
 
-            current = []
-            current_idx = []
-            chars = 0
+            for (
+                seg_id,
+                text,
+                _,
+            ) in batch
+        ]
 
-        current.append(text)
-        current_idx.append(i)
-        chars += extra
+        translated_map = (
+            translate_marked_batch(
+                request_items,
+                target,
+            )
+        )
 
-    if current:
-        batches.append(current)
-        indexes.append(current_idx)
+        return (
+            batch,
+            translated_map,
+        )
 
-    out = list(clean)
-
-    total = len(batches)
-
-    if not total:
-        return texts
-
-    completed = 0
+    # --------------------------------------------------------
+    # Parallel batches
+    # --------------------------------------------------------
 
     with ThreadPoolExecutor(
-        max_workers=workers
+        max_workers=WORKERS
     ) as executor:
 
-        futures = {
+        futures = [
             executor.submit(
-                translate_batch,
+                worker,
                 batch,
-                target,
-            ): n
-            for n, batch in enumerate(batches)
-        }
+            )
 
-        for future in as_completed(futures):
+            for batch in batches
+        ]
 
-            n = futures[future]
+        for future in as_completed(
+            futures
+        ):
 
-            try:
+            batch, translated_map = (
+                future.result()
+            )
 
-                result = future.result()
+            batch_words = 0
 
-            except Exception:
+            for (
+                seg_id,
+                original_text,
+                original_index,
+            ) in batch:
 
-                log.exception(
-                    "batch crashed; preserving original text"
+                translated = (
+                    translated_map.get(
+                        seg_id,
+                        original_text,
+                    )
                 )
 
-                result = batches[n]
+                # A node can contain multiple chunks.
+                if (
+                    out[original_index]
+                    == texts[original_index]
+                ):
 
-            for i, value in zip(
-                indexes[n],
-                result,
-            ):
+                    out[
+                        original_index
+                    ] = translated
 
-                out[i] = value
+                else:
 
-            completed += 1
+                    out[
+                        original_index
+                    ] += (
+                        " "
+                        + translated
+                    )
 
-            if progress:
-
-                progress(
-                    completed,
-                    total,
+                batch_words += word_count(
+                    original_text
                 )
 
-    return [
-        restore_ws(
-            original,
-            translated,
-        )
-        if original.strip()
-        else original
+            with lock:
 
-        for original, translated
-        in zip(texts, out)
-    ]
+                completed_batches += 1
+
+                completed_words += (
+                    batch_words
+                )
+
+                elapsed = max(
+                    0.001,
+                    time.monotonic()
+                    - started,
+                )
+
+                rate = (
+                    completed_words
+                    / elapsed
+                )
+
+                remaining = max(
+                    0,
+                    total_words
+                    - completed_words,
+                )
+
+                eta = (
+                    remaining / rate
+                    if rate > 0
+                    else 0
+                )
+
+                if progress:
+
+                    progress(
+                        completed_batches,
+                        total_batches,
+                        total_words,
+                        completed_words,
+                        eta,
+                    )
+
+    # --------------------------------------------------------
+    # Restore whitespace
+    # --------------------------------------------------------
+
+    for i, original in enumerate(
+        texts
+    ):
+
+        if original.strip():
+
+            out[i] = restore_ws(
+                original,
+                out[i],
+            )
+
+    return (
+        out,
+        total_words,
+    )
 
 
 # ============================================================
@@ -412,17 +657,29 @@ def collect_toc_entries(book):
 
         for item in items:
 
-            if isinstance(item, tuple):
+            if isinstance(
+                item,
+                tuple,
+            ):
 
                 if item:
-                    entries.append(item[0])
+                    entries.append(
+                        item[0]
+                    )
 
                 if len(item) > 1:
-                    walk(item[1])
+                    walk(
+                        item[1]
+                    )
 
-            elif hasattr(item, "title"):
+            elif hasattr(
+                item,
+                "title",
+            ):
 
-                entries.append(item)
+                entries.append(
+                    item
+                )
 
     walk(book.toc)
 
@@ -440,24 +697,26 @@ def translate_epub(
     progress=None,
 ):
 
-    log.info(
-        "Opening EPUB: %s",
-        src,
+    book = epub.read_epub(
+        src
     )
-
-    book = epub.read_epub(src)
 
     docs = [
         item
-        for item in book.get_items()
-        if item.get_type() == ITEM_DOCUMENT
+
+        for item
+        in book.get_items()
+
+        if item.get_type()
+        == ITEM_DOCUMENT
     ]
 
     soups = []
+
     nodes = []
 
     # --------------------------------------------------------
-    # Extract text nodes
+    # Parse HTML
     # --------------------------------------------------------
 
     for item in docs:
@@ -467,7 +726,9 @@ def translate_epub(
             "html.parser",
         )
 
-        soups.append(soup)
+        soups.append(
+            soup
+        )
 
         for node in soup.find_all(
             string=True
@@ -475,7 +736,10 @@ def translate_epub(
 
             if isinstance(
                 node,
-                (Comment, Doctype),
+                (
+                    Comment,
+                    Doctype,
+                ),
             ):
                 continue
 
@@ -484,21 +748,25 @@ def translate_epub(
             if not parent:
                 continue
 
-            if parent.name in SKIP_TAGS:
+            if (
+                parent.name
+                in SKIP_TAGS
+            ):
                 continue
 
             if node.strip():
-                nodes.append(node)
+
+                nodes.append(
+                    node
+                )
 
     # --------------------------------------------------------
-    # TOC
+    # Metadata
     # --------------------------------------------------------
 
-    toc_entries = collect_toc_entries(book)
-
-    # --------------------------------------------------------
-    # Metadata title
-    # --------------------------------------------------------
+    toc_entries = (
+        collect_toc_entries(book)
+    )
 
     metadata = book.get_metadata(
         "DC",
@@ -512,61 +780,43 @@ def translate_epub(
     )
 
     # --------------------------------------------------------
-    # Build translation list
+    # Body text
     # --------------------------------------------------------
 
-    texts = [
+    body_texts = [
         str(node)
         for node in nodes
     ]
 
-    texts += [
-        str(entry.title)
-        for entry in toc_entries
-        if getattr(
-            entry,
-            "title",
-            None,
+    translated_body, body_words = (
+        translate_many(
+            body_texts,
+            target,
+            progress=progress,
         )
-    ]
-
-    if title_text:
-        texts.append(title_text)
-
-    log.info(
-        "Documents=%d, text nodes=%d, total strings=%d",
-        len(docs),
-        len(nodes),
-        len(texts),
     )
 
     # --------------------------------------------------------
-    # Translate
+    # Replace body text
     # --------------------------------------------------------
 
-    translated = translate_many(
-        texts,
-        target,
-        progress=progress,
-    )
-
-    # --------------------------------------------------------
-    # Replace HTML text
-    # --------------------------------------------------------
-
-    pos = 0
-
-    for node in nodes:
+    for (
+        node,
+        translated,
+    ) in zip(
+        nodes,
+        translated_body,
+    ):
 
         node.replace_with(
-            translated[pos]
+            translated
         )
 
-        pos += 1
+    # --------------------------------------------------------
+    # TOC + TITLE
+    # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Replace TOC
-    # --------------------------------------------------------
+    extras = []
 
     for entry in toc_entries:
 
@@ -576,54 +826,90 @@ def translate_epub(
             None,
         ):
 
-            entry.title = translated[pos]
-
-            pos += 1
-
-    # --------------------------------------------------------
-    # Replace title
-    # --------------------------------------------------------
+            extras.append(
+                str(entry.title)
+            )
 
     if title_text:
 
-        new_title = translated[pos]
+        extras.append(
+            title_text
+        )
 
-        try:
+    if extras:
 
-            book.set_unique_metadata(
-                "DC",
-                "title",
-                new_title,
+        extra_translated, _ = (
+            translate_many(
+                extras,
+                target,
+                progress=None,
             )
+        )
 
-        except Exception:
+        p = 0
 
-            book.set_metadata(
-                "DC",
+        for entry in toc_entries:
+
+            if getattr(
+                entry,
                 "title",
-                new_title,
-            )
+                None,
+            ):
+
+                entry.title = (
+                    extra_translated[p]
+                )
+
+                p += 1
+
+        if title_text:
+
+            try:
+
+                book.set_unique_metadata(
+                    "DC",
+                    "title",
+                    extra_translated[p],
+                )
+
+            except Exception:
+
+                book.set_metadata(
+                    "DC",
+                    "title",
+                    extra_translated[p],
+                )
 
     # --------------------------------------------------------
-    # Language metadata
+    # Language
     # --------------------------------------------------------
 
     try:
-        book.set_language(target)
+
+        book.set_language(
+            target
+        )
+
     except Exception:
+
         pass
 
     # --------------------------------------------------------
-    # Write HTML back
+    # Save HTML
     # --------------------------------------------------------
 
-    for item, soup in zip(
+    for (
+        item,
+        soup,
+    ) in zip(
         docs,
         soups,
     ):
 
         item.set_content(
-            str(soup).encode("utf-8")
+            str(soup).encode(
+                "utf-8"
+            )
         )
 
     # --------------------------------------------------------
@@ -638,10 +924,7 @@ def translate_epub(
         },
     )
 
-    log.info(
-        "EPUB created: %s",
-        dst,
-    )
+    return body_words
 
 
 # ============================================================
@@ -662,13 +945,149 @@ def safe_filename(
     ).strip()
 
     if not stem:
-        stem = "translated_book"
 
-    return f"{stem}_{target}.epub"
+        stem = (
+            "translated_book"
+        )
+
+    return (
+        f"{stem}_{target}.epub"
+    )
 
 
 # ============================================================
-# /START
+# TIME FORMAT
+# ============================================================
+
+def format_seconds(
+    seconds,
+):
+
+    seconds = max(
+        0,
+        int(seconds),
+    )
+
+    h, rem = divmod(
+        seconds,
+        3600,
+    )
+
+    m, s = divmod(
+        rem,
+        60,
+    )
+
+    if h:
+
+        return (
+            f"{h}h "
+            f"{m:02d}m "
+            f"{s:02d}s"
+        )
+
+    if m:
+
+        return (
+            f"{m}m "
+            f"{s:02d}s"
+        )
+
+    return f"{s}s"
+
+
+# ============================================================
+# PROGRESS BAR
+# ============================================================
+
+def progress_bar(
+    percent,
+    width=20,
+):
+
+    filled = int(
+        width
+        * percent
+        / 100
+    )
+
+    return (
+        "█" * filled
+        + "░" * (
+            width - filled
+        )
+    )
+
+
+# ============================================================
+# PROGRESS MESSAGE
+# ============================================================
+
+def progress_text(
+    total_words,
+    done_words,
+    started,
+    eta,
+):
+
+    elapsed = max(
+        0.0,
+        time.monotonic()
+        - started,
+    )
+
+    pct = min(
+        100,
+        int(
+            done_words
+            * 100
+            / max(
+                1,
+                total_words,
+            )
+        ),
+    )
+
+    remaining = max(
+        0,
+        total_words
+        - done_words,
+    )
+
+    rate = (
+        done_words / elapsed
+        if elapsed > 0
+        else 0
+    )
+
+    return (
+        "📚 **Translating EPUB**\n\n"
+
+        f"`{progress_bar(pct)}` "
+        f"**{pct}%**\n\n"
+
+        f"⏱ **Estimated time:** "
+        f"{format_seconds(eta)}\n"
+
+        f"⏳ **Used time:** "
+        f"{format_seconds(elapsed)}\n\n"
+
+        f"📄 **File Words:** "
+        f"{total_words:,}\n"
+
+        f"✅ **Translated words:** "
+        f"{done_words:,}\n"
+
+        f"📝 **Remaining words:** "
+        f"{remaining:,}\n\n"
+
+        f"⚡ **Speed:** "
+        f"{rate:,.1f} words/sec"
+    )
+
+
+# ============================================================
+# START
 # ============================================================
 
 async def start(
@@ -680,14 +1099,15 @@ async def start(
 
     await update.message.reply_text(
         "📚 EPUB Translator\n\n"
-        "Send an .epub file, then choose "
-        "the target language.\n\n"
-        f"Maximum file size: {MAX_MB} MB."
+        "Send an .epub file and "
+        "choose the target language.\n\n"
+        f"Maximum file size: "
+        f"{MAX_MB} MB."
     )
 
 
 # ============================================================
-# /HELP
+# HELP
 # ============================================================
 
 async def help_cmd(
@@ -697,23 +1117,24 @@ async def help_cmd(
 
     await update.message.reply_text(
         "📚 EPUB Translator Help\n\n"
-        "1. Send an EPUB file.\n"
-        "2. Choose the target language.\n"
-        "3. Wait for translation.\n"
-        "4. The translated EPUB will be returned.\n\n"
-        "The bot tries to preserve:\n"
-        "• Images\n"
-        "• CSS\n"
-        "• Chapter structure\n"
-        "• EPUB metadata\n"
-        "• Formatting\n\n"
-        "Translation uses Google Translate "
-        "through deep-translator."
+
+        "1. Send an EPUB.\n"
+        "2. Select the language.\n"
+        "3. Watch live progress.\n"
+        "4. Receive the translated EPUB.\n\n"
+
+        "⚡ Fast engine:\n"
+        "• Batch translation\n"
+        "• Parallel workers\n"
+        "• Automatic retries\n"
+        "• ETA\n"
+        "• Words/sec\n"
+        "• Remaining words"
     )
 
 
 # ============================================================
-# RECEIVE EPUB
+# EPUB FILE
 # ============================================================
 
 async def on_file(
@@ -723,23 +1144,20 @@ async def on_file(
 
     doc = update.message.document
 
-    name = doc.file_name or ""
+    name = (
+        doc.file_name
+        or ""
+    )
 
-    # --------------------------------------------------------
-    # Extension
-    # --------------------------------------------------------
-
-    if not name.lower().endswith(".epub"):
+    if not name.lower().endswith(
+        ".epub"
+    ):
 
         await update.message.reply_text(
             "❌ Please send an .epub file."
         )
 
         return
-
-    # --------------------------------------------------------
-    # Size
-    # --------------------------------------------------------
 
     if (
         doc.file_size
@@ -754,18 +1172,17 @@ async def on_file(
 
         return
 
-    # --------------------------------------------------------
-    # Save Telegram file ID
-    # --------------------------------------------------------
+    context.user_data[
+        "file_id"
+    ] = doc.file_id
 
-    context.user_data["file_id"] = doc.file_id
-    context.user_data["name"] = name
+    context.user_data[
+        "name"
+    ] = name
 
-    # --------------------------------------------------------
-    # Language buttons
-    # --------------------------------------------------------
-
-    items = list(LANGS.items())
+    items = list(
+        LANGS.items()
+    )
 
     rows = []
 
@@ -779,11 +1196,15 @@ async def on_file(
             [
                 InlineKeyboardButton(
                     label,
-                    callback_data=f"lang:{code}",
+                    callback_data=(
+                        f"lang:{code}"
+                    ),
                 )
 
                 for code, label
-                in items[i:i + 3]
+                in items[
+                    i:i + 3
+                ]
             ]
         )
 
@@ -798,14 +1219,16 @@ async def on_file(
 
     await update.message.reply_text(
         "🌐 Choose target language:",
-        reply_markup=InlineKeyboardMarkup(
-            rows
+        reply_markup=(
+            InlineKeyboardMarkup(
+                rows
+            )
         ),
     )
 
 
 # ============================================================
-# LANGUAGE SELECTION
+# LANGUAGE CALLBACK
 # ============================================================
 
 async def on_lang(
@@ -817,10 +1240,6 @@ async def on_lang(
 
     await query.answer()
 
-    # --------------------------------------------------------
-    # Cancel
-    # --------------------------------------------------------
-
     if query.data == "cancel":
 
         context.user_data.clear()
@@ -830,10 +1249,6 @@ async def on_lang(
         )
 
         return
-
-    # --------------------------------------------------------
-    # Validate callback
-    # --------------------------------------------------------
 
     if not query.data.startswith(
         "lang:"
@@ -853,88 +1268,126 @@ async def on_lang(
 
         return
 
-    # --------------------------------------------------------
-    # Get stored file
-    # --------------------------------------------------------
-
-    file_id = context.user_data.get(
-        "file_id"
+    file_id = (
+        context.user_data.get(
+            "file_id"
+        )
     )
 
-    name = context.user_data.get(
-        "name",
-        "book.epub",
+    name = (
+        context.user_data.get(
+            "name",
+            "book.epub",
+        )
     )
 
     if not file_id:
 
         await query.edit_message_text(
             "❌ Session expired.\n"
-            "Please send the EPUB again."
+            "Send the EPUB again."
         )
 
         return
 
     await query.edit_message_text(
-        f"⏳ Starting translation → "
+        f"⏳ Preparing translation → "
         f"{LANGS[lang]}\n\n"
-        "Large novels may take some time."
+        "Analyzing EPUB…"
     )
 
+    loop = (
+        asyncio.get_running_loop()
+    )
+
+    message = query.message
+
+    started = time.monotonic()
+
+    state = {
+        "last": 0.0,
+        "last_text": "",
+    }
+
+    total_words_holder = {
+        "value": 0
+    }
+
     # --------------------------------------------------------
-    # Event loop
+    # Telegram UI
     # --------------------------------------------------------
 
-    loop = asyncio.get_running_loop()
+    async def update_ui(
+        text,
+    ):
 
-    progress_message = query.message
+        try:
 
-    last_pct = -1
-    last_update = 0.0
+            await message.edit_text(
+                text,
+                parse_mode="Markdown",
+            )
+
+        except Exception as exc:
+
+            log.debug(
+                "progress update skipped: %s",
+                exc,
+            )
 
     # --------------------------------------------------------
     # Progress callback
     # --------------------------------------------------------
 
     def progress(
-        done,
-        total,
+        done_batches,
+        total_batches,
+        total_words,
+        done_words,
+        eta,
     ):
 
-        nonlocal last_pct
-        nonlocal last_update
-
-        pct = int(
-            done * 100 / max(
-                total,
-                1,
-            )
-        )
+        total_words_holder[
+            "value"
+        ] = total_words
 
         now = time.monotonic()
 
+        # Don't hammer Telegram.
         if (
-            pct >= 100
-            or pct - last_pct >= 10
-            or now - last_update >= 8
+            done_words < total_words
+            and
+            now - state["last"]
+            < UPDATE_SECONDS
         ):
 
-            last_pct = pct
-            last_update = now
+            return
 
-            future = asyncio.run_coroutine_threadsafe(
-                progress_message.edit_text(
-                    f"⏳ Translating… {pct}%"
-                ),
-                loop,
-            )
+        state["last"] = now
 
-            # We intentionally don't wait here.
-            # Translation worker must continue.
-            _ = future
+        text = progress_text(
+            total_words,
+            done_words,
+            started,
+            eta,
+        )
+
+        if (
+            text
+            == state["last_text"]
+        ):
+
+            return
+
+        state["last_text"] = text
+
+        asyncio.run_coroutine_threadsafe(
+            update_ui(text),
+            loop,
+        )
 
     # --------------------------------------------------------
-    # Temporary working directory
+    # Temporary directory
     # --------------------------------------------------------
 
     with tempfile.TemporaryDirectory(
@@ -942,7 +1395,8 @@ async def on_lang(
     ) as tmp:
 
         src = str(
-            Path(tmp) / "input.epub"
+            Path(tmp)
+            / "input.epub"
         )
 
         dst = str(
@@ -956,11 +1410,13 @@ async def on_lang(
         try:
 
             # ------------------------------------------------
-            # Download Telegram file
+            # Download
             # ------------------------------------------------
 
-            tg_file = await context.bot.get_file(
-                file_id
+            tg_file = (
+                await context.bot.get_file(
+                    file_id
+                )
             )
 
             await tg_file.download_to_drive(
@@ -968,17 +1424,20 @@ async def on_lang(
             )
 
             # ------------------------------------------------
-            # Validate EPUB container
+            # Validate
             # ------------------------------------------------
 
-            if not zipfile.is_zipfile(src):
+            if not zipfile.is_zipfile(
+                src
+            ):
 
                 raise ValueError(
-                    "Uploaded file is not a valid EPUB/ZIP container."
+                    "Uploaded file is not "
+                    "a valid EPUB/ZIP container."
                 )
 
             # ------------------------------------------------
-            # Run translation outside async loop
+            # Translation
             # ------------------------------------------------
 
             await loop.run_in_executor(
@@ -994,28 +1453,52 @@ async def on_lang(
             # Validate output
             # ------------------------------------------------
 
-            if not os.path.exists(dst):
+            if (
+                not os.path.exists(dst)
+                or os.path.getsize(dst)
+                == 0
+            ):
 
                 raise ValueError(
-                    "Output EPUB was not created."
-                )
-
-            size = os.path.getsize(dst)
-
-            if size == 0:
-
-                raise ValueError(
-                    "Output EPUB is empty."
+                    "Output EPUB was not "
+                    "created correctly."
                 )
 
             # ------------------------------------------------
-            # Upload
+            # Final progress
             # ------------------------------------------------
 
-            await progress_message.edit_text(
-                "📦 Translation finished.\n"
-                "Uploading EPUB…"
+            final_text = progress_text(
+                total_words_holder[
+                    "value"
+                ],
+                total_words_holder[
+                    "value"
+                ],
+                started,
+                0,
             )
+
+            final_text = (
+                final_text.replace(
+                    "**0%**",
+                    "**100%**",
+                    1,
+                )
+            )
+
+            final_text += (
+                "\n\n"
+                "📦 Uploading translated EPUB…"
+            )
+
+            await update_ui(
+                final_text
+            )
+
+            # ------------------------------------------------
+            # Send EPUB
+            # ------------------------------------------------
 
             with open(
                 dst,
@@ -1023,22 +1506,22 @@ async def on_lang(
             ) as fh:
 
                 await context.bot.send_document(
-                    chat_id=query.message.chat_id,
+                    chat_id=(
+                        query.message.chat_id
+                    ),
                     document=fh,
-                    filename=Path(dst).name,
+                    filename=(
+                        Path(dst).name
+                    ),
                     caption=(
-                        f"✅ Translation complete\n"
-                        f"Language: {LANGS[lang]}"
+                        "✅ Translation complete — "
+                        f"{LANGS[lang]}"
                     ),
                 )
 
-            # ------------------------------------------------
-            # Remove progress message
-            # ------------------------------------------------
-
             try:
 
-                await progress_message.delete()
+                await message.delete()
 
             except Exception:
 
@@ -1050,9 +1533,9 @@ async def on_lang(
                 "Translation failed"
             )
 
-            await progress_message.edit_text(
+            await update_ui(
                 "❌ Translation failed.\n\n"
-                "Your original EPUB was not modified.\n"
+                "The original EPUB was not modified.\n"
                 "Please try again."
             )
 
@@ -1071,7 +1554,9 @@ class HealthHandler(
 
     def do_GET(self):
 
-        self.send_response(200)
+        self.send_response(
+            200
+        )
 
         self.send_header(
             "Content-Type",
@@ -1088,12 +1573,15 @@ class HealthHandler(
         self,
         *args,
     ):
+
         pass
 
 
 def start_health_server():
 
-    port = os.getenv("PORT")
+    port = os.getenv(
+        "PORT"
+    )
 
     if not port:
         return
@@ -1126,12 +1614,6 @@ def main():
     start_health_server()
 
     # Python 3.14 compatibility.
-    #
-    # python-telegram-bot 21.x can expect a current
-    # event loop when run_polling() starts.
-    #
-    # Explicitly create one if none exists.
-
     try:
 
         asyncio.get_event_loop()
@@ -1142,21 +1624,12 @@ def main():
             asyncio.new_event_loop()
         )
 
-    # --------------------------------------------------------
-    # Telegram application
-    # --------------------------------------------------------
-
     app = (
-        Application
-        .builder()
+        Application.builder()
         .token(TOKEN)
         .concurrent_updates(True)
         .build()
     )
-
-    # --------------------------------------------------------
-    # Handlers
-    # --------------------------------------------------------
 
     app.add_handler(
         CommandHandler(
@@ -1186,12 +1659,12 @@ def main():
     )
 
     log.info(
-        "EPUB translator bot started"
+        "EPUB translator bot started | "
+        "workers=%d | batch_chars=%d | chunk=%d",
+        WORKERS,
+        BATCH_CHARS,
+        CHUNK,
     )
-
-    # --------------------------------------------------------
-    # Start polling
-    # --------------------------------------------------------
 
     app.run_polling(
         allowed_updates=Update.ALL_TYPES
