@@ -1,4 +1,4 @@
-name: Run EPUB Translation Bot
+name: Run bot
 
 on:
   workflow_dispatch:
@@ -36,5 +36,6 @@ jobs:
       - name: Start bot
         run: |
           python bot.py
+
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
