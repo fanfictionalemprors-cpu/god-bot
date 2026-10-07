@@ -1,0 +1,4 @@
+python-telegram-bot==21.6
+EbookLib==0.18
+beautifulsoup4==4.12.3
+deep-translator==1.11.4
